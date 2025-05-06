@@ -7,7 +7,7 @@ from config import *
 import random
 import os
 import csv
-
+from utils import sample_start_goal
 class OSMGraphEnv(gym.Env):
     def __init__(self, graph, start_node, goal_node, global_bounds=None):
         super(OSMGraphEnv, self).__init__()
@@ -36,7 +36,7 @@ class OSMGraphEnv(gym.Env):
             self.x_min, self.x_max = x.min(), x.max()
             self.y_min, self.y_max = y.min(), y.max()
         self.max_distance = np.sqrt((self.x_max - self.x_min)**2 + (self.y_max - self.y_min)**2)
-        self.visited_nodes = set()
+        self.visited_nodes = []
 
     def step(self, action):
         neighbors = list(self.neighbor_fn(self.current_node))
@@ -64,9 +64,15 @@ class OSMGraphEnv(gym.Env):
             }
 
         # Lấy hành động được chọn trong danh sách hợp lệ
-        action = action % len(valid_next_nodes)
-        _, next_node = valid_next_nodes[action]
+        if action >= len(valid_next_nodes):
+            print(f"[ERROR] Action {action} out of range! Valid range: 0 to {len(valid_next_nodes)-1}")
+            return self.get_state(), float(MIN_REWARD), True, {
+                "dist_to_goal": float('inf'),
+                "reachable": False,
+                "final_node": self.current_node
+            }
 
+        _, next_node = valid_next_nodes[action]
         # Path-based distances
         try:
             sp_current = nx.shortest_path(self.graph, self.current_node, self.goal_node, weight='length')
@@ -89,14 +95,14 @@ class OSMGraphEnv(gym.Env):
                 "final_node": next_node
             }
         
-        if hasattr(self, "initial_path_len") and dist_next_goal > 3 * self.initial_path_len:
-            print(f"[Abort] Agent quá xa goal ({dist_next_goal:.2f}m), kết thúc sớm.")
-            return self.get_state(), float(MIN_REWARD), True, {
-                "dist_to_goal": dist_next_goal,
-                "reachable": False,
-                "final_node": next_node,
-                "goal_reached": False
-            }
+        # if hasattr(self, "initial_path_len") and dist_next_goal > 3 * self.initial_path_len:
+        #     print(f"[Abort] Agent quá xa goal ({dist_next_goal:.2f}m), kết thúc sớm.")
+        #     return self.get_state(), float(MIN_REWARD), True, {
+        #         "dist_to_goal": dist_next_goal,
+        #         "reachable": False,
+        #         "final_node": next_node,
+        #         "goal_reached": False
+        #     }
 
         # Initial distance used for reward normalization
         if self.steps == 0:
@@ -122,7 +128,7 @@ class OSMGraphEnv(gym.Env):
         if improvement > 0.1 * self.initial_path_len:
             reward += 2.0
 
-        self.visited_nodes.add(next_node)
+        self.visited_nodes.append(next_node)
 
         done = False
         goal_reached = next_node == self.goal_node or dist_next_goal < 25.0
@@ -165,66 +171,71 @@ class OSMGraphEnv(gym.Env):
             "dist_to_goal": dist_next_goal,
             "reachable": reachable,
             "final_node": next_node,
-            "goal_reached": goal_reached
+            "goal_reached": goal_reached,
+            "visited_count": self.visited_nodes.count(next_node)
+
         }
 
     def get_state(self):
-        eps = 1e-6
         n = lambda i: self.graph.nodes[i]
         current, goal = n(self.current_node), n(self.goal_node)
 
-        def norm_x(x): return (x - self.x_min) / (self.x_max - self.x_min + eps) * 2 - 1
-        def norm_y(y): return (y - self.y_min) / (self.y_max - self.y_min + eps) * 2 - 1
+        norm = lambda x, min_val, max_val: (x - min_val) / (max_val - min_val + 1e-8)
 
-        cx, cy, gx, gy = norm_x(current['x']), norm_y(current['y']), norm_x(goal['x']), norm_y(goal['y'])
-        dx, dy = gx - cx, gy - cy
-        angle = np.arctan2(dy, dx)
-        distance = np.sqrt(dx**2 + dy**2)
-
-        deg_current = len(list(self.neighbor_fn(self.current_node))) / 10.0
-        deg_goal = len(list(self.neighbor_fn(self.goal_node))) / 10.0
-        visited_ratio = len(self.visited_nodes) / max(1, self.graph.number_of_nodes())
-
-        state = np.array([
-            cx, cy, gx, gy,
-            np.cos(angle), np.sin(angle),
-            distance,
-            self.steps / self.max_steps,
-            deg_current, deg_goal,
-            visited_ratio
-        ], dtype=np.float32)
-
-        return state if np.all(np.isfinite(state)) else np.zeros(11, dtype=np.float32)
+        state = [
+            norm(current["x"], self.x_min, self.x_max),
+            norm(current["y"], self.y_min, self.y_max),
+            norm(goal["x"], self.x_min, self.x_max),
+            norm(goal["y"], self.y_min, self.y_max),
+            self.graph.degree[self.current_node] / 10,
+            self.graph.degree[self.goal_node] / 10,
+            nx.shortest_path_length(self.graph, self.current_node, self.goal_node, weight="length") / 1000,
+            current.get("street_type", 0) / 10,
+            goal.get("street_type", 0) / 10,
+            int(current.get("highway", "no") == "yes"),
+            int(goal.get("highway", "no") == "yes"),
+        ]
+        return np.array(state, dtype=np.float32)
 
     def reset(self):
         self.current_node = self.start_node
         self.steps = 0
-        self.visited_nodes = set()
+        self.visited_nodes = []
         return self.get_state()
 
     def set_start_goal(self, start, goal):
-        self.start_node = start
-        self.goal_node = goal
-        self.current_node = start
+        if start is not None and goal is not None:
+            self.start_node = start
+            self.goal_node = goal
 
     def render_path(self, path, filename=None):
         if not path: return
         pos = {n: (self.graph.nodes[n]['x'], self.graph.nodes[n]['y']) for n in self.graph.nodes}
         plt.figure(figsize=(10, 8))
         nx.draw(self.graph, pos, node_size=10, node_color='gray', edge_color='lightgray', alpha=0.5)
+
+        # Draw agent path
         if len(path) > 1:
             edges = [(path[i], path[i+1]) for i in range(len(path)-1)]
             nx.draw_networkx_edges(self.graph, pos, edgelist=edges, edge_color='red', width=2)
-        if path[0] in pos:
-            nx.draw_networkx_nodes(self.graph, pos, nodelist=[path[0]], node_color='green', node_size=100)
-        if path[-1] in pos:
-            nx.draw_networkx_nodes(self.graph, pos, nodelist=[path[-1]], node_color='blue', node_size=100)
+
+        # Always draw correct start (green) and goal (blue)
+        if self.start_node in pos:
+            nx.draw_networkx_nodes(self.graph, pos, nodelist=[self.start_node], node_color='green', node_size=100)
+        if self.goal_node in pos:
+            nx.draw_networkx_nodes(self.graph, pos, nodelist=[self.goal_node], node_color='blue', node_size=100)
+
+        # (Optional) Mark where the agent actually stopped (purple if fail)
+        if path[-1] != self.goal_node:
+            nx.draw_networkx_nodes(self.graph, pos, nodelist=[path[-1]], node_color='purple', node_size=80)
+
         try:
-            sp = nx.shortest_path(self.graph, path[0], path[-1], weight='length')
+            sp = nx.shortest_path(self.graph, self.start_node, self.goal_node, weight='length')
             sp_edges = list(zip(sp[:-1], sp[1:]))
             nx.draw_networkx_edges(self.graph, pos, edgelist=sp_edges, edge_color='green', style='dashed', width=2)
         except:
             pass
+
         plt.axis('off')
         plt.title("Agent Path")
         if filename:
@@ -232,3 +243,4 @@ class OSMGraphEnv(gym.Env):
             plt.close()
         else:
             plt.show()
+

@@ -1,5 +1,3 @@
-# main.py
-
 import os
 import matplotlib.pyplot as plt
 from config import *
@@ -23,9 +21,9 @@ def main():
         'District 4, Ho Chi Minh City, Vietnam',
     ]
     eval_districts = [
-    'District 8, Ho Chi Minh City, Vietnam',
-    'District 10, Ho Chi Minh City, Vietnam',
-    'District 12, Ho Chi Minh City, Vietnam',
+        'District 8, Ho Chi Minh City, Vietnam',
+        'District 10, Ho Chi Minh City, Vietnam',
+        'District 12, Ho Chi Minh City, Vietnam',
     ]
 
     # Calculate global bounds for state normalization
@@ -50,18 +48,26 @@ def main():
             with open(cache_file, 'rb') as f:
                 G = pickle.load(f)
         else:
-            G = load_graph(place_name)
+            G = load_graph(place)
             with open(cache_file, 'wb') as f:
                 pickle.dump(G, f)
-        for _ in range(3):  # 3 local agents
+
+        for agent_idx in range(3):
             start, goal = sample_start_goal(G, min_dist=START_GOAL_MIN_DIST, max_dist=START_GOAL_MAX_DIST, force_far=True)
-            env = OSMGraphEnv(G, start, goal, global_bounds) 
+            env = OSMGraphEnv(G, start, goal, global_bounds)
             agent = DQNAgent(state_size=STATE_SIZE, action_size=env.action_space.n)
-            train_cycle(env, agent, episodes=400, max_steps=700, cycle_num=cycle+1, graph=G,start=start, goal=goal)
-            perf, _, _ = evaluate_agent(agent, env, episodes=10,start=start, goal=goal)
+            train_cycle(env, agent, episodes=400, max_steps=700, cycle_num=cycle+1, graph=G, start=start, goal=goal, agent_idx=agent_idx)
+
+            # Load best model for evaluation
+            model_path = f"models/agent_cycle{cycle+1}_agent{agent_idx}_best.pt"
+            best_agent = DQNAgent(state_size=STATE_SIZE, action_size=env.action_space.n)
+            best_agent.load(model_path)
+            best_agent.update_target_model()
+
+            perf, _, _ = evaluate_agent(best_agent, env, episodes=10, start=start, goal=goal)
             local_perfs.append(perf)
-            local_models.append(agent.model)
-            print(f"Cycle {cycle+1}: Start={start}, Goal={goal}, Distance={nx.shortest_path_length(G, start, goal, weight='length')}")
+            local_models.append(best_agent.model)
+            print(f"Cycle {cycle+1}: Agent {agent_idx} | Start={start}, Goal={goal}, Distance={nx.shortest_path_length(G, start, goal, weight='length')}")
 
     # Aggregation
     from agent import DQNNetwork
@@ -83,22 +89,21 @@ def main():
     fine_agent = DQNAgent(state_size=STATE_SIZE, action_size=env_ft.action_space.n)
     fine_agent.model.load_state_dict(global_model.state_dict())
     fine_agent.update_target_model()
-    train_cycle(env_ft, fine_agent, episodes=400, max_steps=700, cycle_num=99, graph=G_ft)
-    
+    train_cycle(env_ft, fine_agent, episodes=400, max_steps=700, cycle_num=99, graph=G_ft, start=s, goal=g, agent_idx=0)
+
     # Final eval
     for place in eval_districts:
-        cache_file = f"cache/{place_name}.pkl"
+        cache_file = f"cache/{place}.pkl"
         if os.path.exists(cache_file):
             with open(cache_file, 'rb') as f:
                 G = pickle.load(f)
         else:
-            G = load_graph(place_name)
+            G = load_graph(place)
             with open(cache_file, 'wb') as f:
                 pickle.dump(G, f)
-        G = load_graph(place)
         s, g = sample_start_goal(G, min_dist=2000, max_dist=10000, force_far=True)
         env = OSMGraphEnv(G, s, g, global_bounds)
-        evaluate_agent(fine_agent, env, episodes=10)
+        evaluate_agent(fine_agent, env, episodes=10, start=s, goal=g)
 
     os.makedirs("models", exist_ok=True)
     fine_agent.save("models/global_model.pt")
