@@ -3,8 +3,8 @@
 # Reward settings
 REWARD_SCALE      = 75     # Scaling factor for distance-based reward
 GOAL_REWARD       = 700    # Reward when reaching goal
-ALIGN_REWARD      = 1.0    # Bonus when moving in right direction
-REPEAT_PENALTY    = 2.0    # Penalty for visiting same node
+ALIGN_REWARD      = 3.0    # Bonus when moving in right direction
+REPEAT_PENALTY    = 5.0    # Penalty for visiting same node
 STEP_PENALTY      = 0.05   # Penalty per step to encourage shorter path
 DEAD_END_PENALTY  = 30.0   # Penalty for reaching dead-end
 MAX_REWARD        = 300

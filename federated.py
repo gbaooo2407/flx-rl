@@ -23,43 +23,58 @@ def federated_averaging(global_model, local_models, weights=None):
     return global_model
 
 
-def knowledge_distillation(global_model, local_models, env, episodes=200, batch_size=32):
+def knowledge_distillation(global_model, local_models, graph, global_bounds,
+                                     episodes=200, batch_size=32, n_buffer_episodes=30):
+
+    from env import OSMGraphEnv
+    from utils import sample_start_goal
+
     student = global_model
     teacher_ensemble = [model.eval() for model in local_models]
     optimizer = optim.Adam(student.parameters(), lr=0.0001)
     loss_fn = nn.MSELoss()
 
-    replay_buffer = []
-    for _ in range(100):
+    # Step 1: Chọn teacher tốt nhất để tạo replay buffer
+    best_teacher = teacher_ensemble[0]
+    env_buffer = []
+
+    for _ in range(n_buffer_episodes):
+        s, g = sample_start_goal(graph, min_dist=1000, max_dist=6000)
+        env = OSMGraphEnv(graph, s, g, global_bounds)
         state = env.reset()
         done = False
         while not done:
-            neighbors = list(env.neighbor_fn(env.current_node))
-            if not neighbors:
-                break
-            state_tensor = torch.FloatTensor(state).unsqueeze(0)
             with torch.no_grad():
-                action = student(state_tensor).argmax().item()
+                q_values = best_teacher(torch.FloatTensor(state).unsqueeze(0))
+                action = torch.argmax(q_values).item()
             next_state, _, done, _ = env.step(action)
-            replay_buffer.append(state)
+            env_buffer.append(state)
             state = next_state
-            if len(replay_buffer) > 5000:
+            if len(env_buffer) >= 5000:
                 break
-    if len(replay_buffer) < batch_size:
-        print(" Replay buffer too small for distillation")
+        if len(env_buffer) >= 5000:
+            break
+
+    if len(env_buffer) < batch_size:
+        print("[Distill] ⚠️ Replay buffer quá nhỏ.")
         return student
 
+    # Step 2: Train student model để bắt chước teacher ensemble
     for ep in range(episodes):
-        batch_states = random.sample(replay_buffer, batch_size)
+        batch_states = random.sample(env_buffer, batch_size)
         state_tensor = torch.FloatTensor(batch_states)
         with torch.no_grad():
-            teacher_outputs = torch.stack([teacher(state_tensor) for teacher in teacher_ensemble]).mean(dim=0)
-        student_output = student(state_tensor)
-        loss = loss_fn(student_output, teacher_outputs)
+            teacher_outputs = torch.stack([t(state_tensor) for t in teacher_ensemble]).mean(dim=0)
+        student_outputs = student(state_tensor)
+        loss = loss_fn(student_outputs, teacher_outputs)
+
         optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(student.parameters(), 1.0)
         optimizer.step()
+
         if (ep + 1) % 10 == 0:
-            print(f"Distill [{ep+1}/{episodes}] - Loss: {loss.item():.4f}")
+            print(f"[Distill-Advanced] Ep {ep+1}/{episodes} | Loss: {loss.item():.4f}")
+
     return student
+

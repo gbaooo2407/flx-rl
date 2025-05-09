@@ -5,21 +5,8 @@ import random
 import logging
 from networkx.algorithms.components import weakly_connected_components
 
-def create_synthetic_graph():
-    G = nx.grid_2d_graph(5, 5)
-    G = nx.convert_node_labels_to_integers(G)
-    for node in G.nodes:
-        G.nodes[node]['x'] = node % 5
-        G.nodes[node]['y'] = node // 5
-    for u, v in G.edges:
-        G[u][v]['length'] = 1.0
-    return G
 
-def load_graph(place_name='District 1, Ho Chi Minh City, Vietnam', use_synthetic=False):
-    if use_synthetic:
-        logging.info("Using synthetic 5x5 grid graph")
-        G = create_synthetic_graph()
-        return G
+def load_graph(place_name):
 
     G = ox.graph_from_place(place_name, network_type='drive', simplify=False)
     if not isinstance(G, nx.MultiDiGraph):

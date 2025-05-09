@@ -94,15 +94,6 @@ class OSMGraphEnv(gym.Env):
                 "reachable": False,
                 "final_node": next_node
             }
-        
-        # if hasattr(self, "initial_path_len") and dist_next_goal > 3 * self.initial_path_len:
-        #     print(f"[Abort] Agent quá xa goal ({dist_next_goal:.2f}m), kết thúc sớm.")
-        #     return self.get_state(), float(MIN_REWARD), True, {
-        #         "dist_to_goal": dist_next_goal,
-        #         "reachable": False,
-        #         "final_node": next_node,
-        #         "goal_reached": False
-        #     }
 
         # Initial distance used for reward normalization
         if self.steps == 0:
@@ -125,8 +116,8 @@ class OSMGraphEnv(gym.Env):
         if improvement > 0:
             reward += 0.5
         # Bonus for large progress
-        if improvement > 0.1 * self.initial_path_len:
-            reward += 2.0
+        if improvement > 0.03 * self.initial_path_len:
+            reward += 3.0
 
         self.visited_nodes.append(next_node)
 
