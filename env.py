@@ -24,8 +24,7 @@ class OSMGraphEnv(gym.Env):
         self.is_directed = isinstance(graph, (nx.DiGraph, nx.MultiDiGraph))
         self.neighbor_fn = graph.successors if self.is_directed else graph.neighbors
 
-        max_neighbors = max(len(list(self.neighbor_fn(n))) for n in graph.nodes)
-        self.action_space = spaces.Discrete(max_neighbors)
+        self.action_space = spaces.Discrete(MAX_ACTIONS)
         self.observation_space = spaces.Box(low=-1, high=1, shape=(11,), dtype=np.float32)
 
         x = np.array([graph.nodes[n]['x'] for n in graph.nodes])
@@ -99,32 +98,53 @@ class OSMGraphEnv(gym.Env):
         if self.steps == 0:
             self.initial_path_len = dist_current_goal if np.isfinite(dist_current_goal) else self.max_distance
 
+        # Điều chỉnh cách tính reward
         improvement = dist_current_goal - dist_next_goal
-        reward = (improvement / (self.initial_path_len + 1e-6)) * self.reward_scale
-
-        # Penalty for backtracking to previous node
-        if improvement < 0 and len(self.visited_nodes) > 1 and next_node == list(self.visited_nodes)[-2]:
-            reward -= 1.0
-
-        # Step penalty
-        reward -= self.step_penalty
-
-        # Penalty for repeating nodes
-        if next_node in self.visited_nodes:
-            reward -= REPEAT_PENALTY
-
+        
+        # Cải thiện reward scale dựa trên tiến trình
+        progress_percentage = improvement / (self.initial_path_len + 1e-6)
+        reward = progress_percentage * self.reward_scale
+        
+        # Thêm reward trung gian cho việc đi đúng hướng
         if improvement > 0:
-            reward += 0.5
-        # Bonus for large progress
-        if improvement > 0.03 * self.initial_path_len:
-            reward += 3.0
+            # Khuyến khích bất kỳ sự tiến bộ nào, nhỏ hay lớn
+            reward += 1.0 + (progress_percentage * 10)  # Reward nhỏ cho tiến bộ, tỷ lệ với mức độ cải thiện
+        
+        # Giảm mức phạt cho backtracking
+        if improvement < 0 and len(self.visited_nodes) > 1 and next_node == list(self.visited_nodes)[-2]:
+            reward -= 0.5  # Giảm từ 1.0 xuống 0.5
+        
+        # Step penalty vẫn giữ nguyên
+        reward -= self.step_penalty
+        
+        # Sửa đổi phạt lặp lại node để ít khắc nghiệt hơn
+        if next_node in self.visited_nodes:
+            # Phạt nhỏ với node mới ghé thăm, tăng dần với mỗi lần lặp lại
+            visit_count = self.visited_nodes.count(next_node)
+            repeat_penalty = min(REPEAT_PENALTY * (visit_count * 0.5), REPEAT_PENALTY * 2)
+            reward -= repeat_penalty
+        
+        # Cải thiện reward cho tiến bộ lớn
+        if improvement > 0.03 * self.initial_path_len:  # Giữ ngưỡng này
+            reward += 3.0  
+        
+        # Reward bổ sung khi gần đến mục tiêu, tạo hiệu ứng "hút" agent về đích
+        if dist_next_goal < self.initial_path_len * 0.2:  # Trong 20% cuối đường đi
+            reward += 2.5
+        elif dist_next_goal < self.initial_path_len * 0.5:  # Trong 50% cuối đường đi
+            reward += 1.0
 
         self.visited_nodes.append(next_node)
 
+        goal_reached = next_node == self.goal_node
+        very_close_to_goal = dist_next_goal < 25.0
         done = False
-        goal_reached = next_node == self.goal_node or dist_next_goal < 25.0
+
         if goal_reached:
             reward += self.goal_reward
+            done = True
+        elif very_close_to_goal:
+            reward += self.goal_reward * 0.8  # 80% phần thưởng khi đến rất gần
             done = True
         if not goal_reached and done:
             print(f"[Fail] Final node: {next_node}, Distance to goal: {dist_next_goal:.2f} m")
@@ -172,7 +192,30 @@ class OSMGraphEnv(gym.Env):
         current, goal = n(self.current_node), n(self.goal_node)
 
         norm = lambda x, min_val, max_val: (x - min_val) / (max_val - min_val + 1e-8)
-
+        
+        # Tính toán một số đặc trưng bổ sung
+        try:
+            shortest_path = nx.shortest_path(self.graph, self.current_node, self.goal_node, weight="length")
+            path_length = nx.path_weight(self.graph, shortest_path, weight="length")
+            normalized_path_length = path_length / 1000  # Đổi sang km
+            
+            # Đếm số neighbor nodes dẫn về phía mục tiêu
+            neighbors = list(self.neighbor_fn(self.current_node))
+            good_neighbors = 0
+            for neighbor in neighbors:
+                try:
+                    nb_path = nx.shortest_path(self.graph, neighbor, self.goal_node, weight="length")
+                    if len(nb_path) < len(shortest_path):
+                        good_neighbors += 1
+                except:
+                    continue
+            
+            good_neighbors_ratio = good_neighbors / max(1, len(neighbors))
+        except:
+            normalized_path_length = 1.0  # Giá trị mặc định cao
+            good_neighbors_ratio = 0.0
+        
+        # Cải thiện state vector với thông tin thêm
         state = [
             norm(current["x"], self.x_min, self.x_max),
             norm(current["y"], self.y_min, self.y_max),
@@ -180,12 +223,16 @@ class OSMGraphEnv(gym.Env):
             norm(goal["y"], self.y_min, self.y_max),
             self.graph.degree[self.current_node] / 10,
             self.graph.degree[self.goal_node] / 10,
-            nx.shortest_path_length(self.graph, self.current_node, self.goal_node, weight="length") / 1000,
+            normalized_path_length,
             current.get("street_type", 0) / 10,
             goal.get("street_type", 0) / 10,
             int(current.get("highway", "no") == "yes"),
             int(goal.get("highway", "no") == "yes"),
+            # Thêm 2 đặc trưng mới
+            good_neighbors_ratio,  # Tỷ lệ neighbor nodes dẫn về phía mục tiêu
+            min(1.0, self.steps / 200)  # Thêm thông tin về thời gian (chuẩn hóa)
         ]
+        
         return np.array(state, dtype=np.float32)
 
     def reset(self):

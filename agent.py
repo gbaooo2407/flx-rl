@@ -106,11 +106,14 @@ class DQNAgent:
                 invalid_actions = set(range(self.action_size)) - set(valid_actions)
                 for a in invalid_actions:
                     masked_q[a] = float('-inf')
+
                 if env:
                     neighbors = list(env.neighbor_fn(env.current_node))
                     penalties = [env.visited_nodes.count(node) for node in neighbors]
                     for i, a in enumerate(valid_actions):
-                        masked_q[a] -= penalties[i] * 5.0
+                        if a < self.action_size:  # Check safety
+                            masked_q[a] -= penalties[i] * 5.0
+                
                 return torch.argmax(masked_q).item()
 
         else:
@@ -146,10 +149,25 @@ class DQNAgent:
         batch, indices, weights = self.memory.sample(self.batch_size)
 
         states = torch.from_numpy(np.array([b[0] for b in batch], dtype=np.float32))
-        actions = torch.tensor([b[1] for b in batch], dtype=torch.long).unsqueeze(1)
-        rewards = torch.tensor([b[2] for b in batch], dtype=torch.float32).unsqueeze(1)
+        actions = torch.tensor([b[1] for b in batch], dtype=torch.long)
+        rewards = torch.tensor([b[2] for b in batch], dtype=torch.float32)
         next_states = torch.from_numpy(np.array([b[3] for b in batch], dtype=np.float32))
-        dones = torch.tensor([b[4] for b in batch], dtype=torch.float32).unsqueeze(1)
+        dones = torch.tensor([b[4] for b in batch], dtype=torch.float32)
+        weights = weights
+
+        # Filter out samples with invalid action index
+        valid_mask = actions < self.action_size
+        if not valid_mask.any():
+            print("[SKIP] All actions in batch are invalid.")
+            return
+
+        # Filter all tensors accordingly
+        states = states[valid_mask]
+        actions = actions[valid_mask].unsqueeze(1)
+        rewards = rewards[valid_mask].unsqueeze(1)
+        next_states = next_states[valid_mask]
+        dones = dones[valid_mask].unsqueeze(1)
+        weights = weights[valid_mask]
 
         q_values = self.model(states).gather(1, actions)
 
@@ -162,14 +180,12 @@ class DQNAgent:
         loss_fn = nn.SmoothL1Loss(reduction='none')
         losses = loss_fn(q_values, target_q)
         weighted_loss = (losses * weights.unsqueeze(1)).mean()
-
-        # ✅ Cập nhật td-error vào buffer
+        #  Update priorities
         with torch.no_grad():
             td_errors = (q_values - target_q).squeeze().abs().cpu().numpy()
-            for i, idx in enumerate(indices):
-                self.memory.priorities[idx] = td_errors[i] + 1e-4  # tránh 0
+            for i, idx in enumerate(indices[valid_mask]):
+                self.memory.priorities[idx] = td_errors[i] + 1e-4
 
-        # Backprop
         self.optimizer.zero_grad()
         weighted_loss.backward()
         nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)

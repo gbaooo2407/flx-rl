@@ -1,12 +1,10 @@
+import time, os, csv, random
 import numpy as np
 import matplotlib.pyplot as plt
-import networkx as nx
-import os
 from tqdm import trange
-from config import *
+from utils import sample_start_goal, sample_by_spatial_distribution
+import networkx as nx
 from env import OSMGraphEnv
-from utils import sample_start_goal,sample_by_spatial_distribution
-
 
 def evaluate_agent(agent, base_env, episodes=10, max_steps=700, start=None, goal=None):
     import csv
@@ -15,7 +13,7 @@ def evaluate_agent(agent, base_env, episodes=10, max_steps=700, start=None, goal
     eval_log = []
 
     for ep in range(episodes):
-        start, goal = sample_start_goal(base_env.graph, min_dist=2000, max_dist=10000, force_far=True)
+        start, goal = sample_start_goal(base_env.graph, min_dist=800, max_dist=4000, force_far=False)
         env = OSMGraphEnv(base_env.graph, start, goal,
                           global_bounds=(base_env.x_min, base_env.x_max, base_env.y_min, base_env.y_max))
         state = env.reset()
@@ -75,13 +73,7 @@ def evaluate_agent(agent, base_env, episodes=10, max_steps=700, start=None, goal
 
     return np.mean(total_rewards), goal_reached / episodes, paths
 
-def train_cycle(env, agent, episodes, max_steps, cycle_num, graph, start, goal, agent_idx=0):
-    import time, os, csv, random
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from tqdm import trange
-    from utils import sample_start_goal, sample_by_spatial_distribution
-    from agent import PrioritizedReplayBuffer
+def train_cycle(env, agent, episodes, max_steps, cycle_num, graph, agent_idx=0):
     os.makedirs("training_progress/paths/success", exist_ok=True)
     os.makedirs("training_progress/paths/fail", exist_ok=True)
     os.makedirs("training_progress/logs", exist_ok=True)
@@ -90,35 +82,16 @@ def train_cycle(env, agent, episodes, max_steps, cycle_num, graph, start, goal, 
     best_reward = float('-inf')
     best_path = None
     rewards_history, success_history, guided_ratios = [], [], []
-    best_success_rate, early_stop_counter, patience = 0, 0, 50
-    phase_split = 0
+    early_stop_counter, patience = 0, 50
 
     for episode in trange(episodes, desc=f"Cycle {cycle_num} Training Agent {agent_idx}"):
         start_time = time.perf_counter()
 
-        # --- Phase Switching ---
-        if phase_split == 0 and episode >= 20 and len(success_history) >= 15:
-            recent_success = sum(success_history[-15:])
-            recent_guided_ratio = np.mean(guided_ratios[-15:])
-            print(f"[CHECK] Episode {episode} | Success={recent_success}/15 | Guided Ratio={recent_guided_ratio:.2f}")
-            if recent_success / 15.0 >= 0.8 and recent_guided_ratio < 0.3:
-                phase_split = episode
-                print(f"[PHASE SHIFT] → Agent enters Phase 2 at episode {episode}")
-                early_stop_counter = 0
-                # ✅ Reset replay buffer to remove phase 1 bias
-                agent.memory = PrioritizedReplayBuffer(agent.memory.capacity)
-
-        # --- Adjust start-goal pair after phase split ---
-        if phase_split > 0 and episode >= phase_split:
-            r = random.random()
-            if r < 0.25:
-                current_start, current_goal = start, goal
-            elif r < 0.6:
-                current_start, current_goal = sample_start_goal(graph, min_dist=1000, max_dist=4000)
-            else:
-                current_start, current_goal = sample_by_spatial_distribution(graph)
+        # Sample diverse start-goal pairs from the beginning
+        if random.random() < 0.6:
+            current_start, current_goal = sample_start_goal(graph, min_dist=800, max_dist=4000)
         else:
-            current_start, current_goal = start, goal
+            current_start, current_goal = sample_by_spatial_distribution(graph)
 
         env.set_start_goal(current_start, current_goal)
         state = env.reset()
@@ -126,11 +99,8 @@ def train_cycle(env, agent, episodes, max_steps, cycle_num, graph, start, goal, 
         total_reward, steps, guided_steps = 0, 0, 0
         done, distances = False, []
 
-        # --- Guided Ratio Setup ---
-        if episode < phase_split or phase_split == 0:
-            guided_ratio = max(0.8 * np.exp(-episode / (episodes * 0.1)), 0.05)
-        else:
-            guided_ratio = max(0.4 * np.exp(-(episode - phase_split) / (episodes * 0.3)), 0.05)
+        # Guided ratio decay quickly
+        guided_ratio = max(0.5 * np.exp(-episode / 50), 0.05)
 
         while not done and steps < max_steps:
             neighbors = list(env.neighbor_fn(env.current_node))
@@ -153,7 +123,7 @@ def train_cycle(env, agent, episodes, max_steps, cycle_num, graph, start, goal, 
 
             valid_indices = [node for _, node in valid_next_nodes]
             if sp and len(sp) > 1 and sp[1] in valid_indices and random.random() < guided_ratio:
-                if guided_steps / max(steps, 1) < 0.3:
+                if guided_steps / max(steps, 1) < 0.4:
                     action = valid_indices.index(sp[1])
                     guided_steps += 1
                     guided = True
@@ -162,12 +132,13 @@ def train_cycle(env, agent, episodes, max_steps, cycle_num, graph, start, goal, 
                 action = agent.act(state, valid_actions, env)
 
             next_state, reward, done, info = env.step(action)
-            clipped_reward = float(np.clip(reward, -300, 300))
+            clipped_reward = float(np.clip(reward, -200, 500))
 
             visit_count = path.count(env.current_node)
             if visit_count > 3:
-                clipped_reward -= 1.0 * (visit_count - 3)  # ✅ tăng phạt loop node trong train
-            
+                loop_penalty = 0.5 * np.log2(visit_count - 2)
+                clipped_reward -= loop_penalty
+
             agent.remember(state, action, clipped_reward, next_state, done)
             if steps % 2 == 0 or done:
                 agent.train()
@@ -181,7 +152,8 @@ def train_cycle(env, agent, episodes, max_steps, cycle_num, graph, start, goal, 
         goal_reached = env.current_node == env.goal_node or info.get("dist_to_goal", float('inf')) < 25.0
         rewards_history.append(total_reward)
         success_history.append(1 if goal_reached else 0)
-        guided_ratios.append(guided_steps / max(steps, 1))
+        guided_ratio_actual = guided_steps / max(steps, 1)
+        guided_ratios.append(guided_ratio_actual)
 
         suffix = f"c{cycle_num}_a{agent_idx}_ep{episode+1}_s{current_start}_g{current_goal}.png"
         render_dir = "success" if goal_reached else "fail"
@@ -190,19 +162,20 @@ def train_cycle(env, agent, episodes, max_steps, cycle_num, graph, start, goal, 
         print(f"Ep {episode+1}: {'GOAL REACHED' if goal_reached else 'FAILED'} | Reward={total_reward:.2f} | Steps={steps} | Guided={guided_steps}")
 
         if agent.epsilon > agent.epsilon_min:
-            agent.epsilon = max(agent.epsilon * agent.epsilon_decay, agent.epsilon_min)
+            agent.epsilon = max(agent.epsilon * (agent.epsilon_decay + 0.001), agent.epsilon_min)
 
-        if goal_reached and total_reward > best_reward:
+        # Save best model only if it's low-guided
+        if goal_reached and total_reward > best_reward and guided_steps <= 10:
             best_reward = total_reward
             best_path = path.copy()
             model_path = f"models/agent_cycle{cycle_num}_agent{agent_idx}_best.pt"
             agent.save(model_path)
+            print(f"[SAVE] Best model saved with reward {total_reward:.2f} to {model_path}")
             env.render_path(best_path, f"training_progress/paths/best_cycle{cycle_num}_agent{agent_idx}_ep{episode+1}.png")
 
         if len(success_history) >= 10:
             recent_success = sum(success_history[-10:]) / 10.0
-            if recent_success >= best_success_rate:
-                best_success_rate = recent_success
+            if recent_success >= 0.8:
                 early_stop_counter = 0
             else:
                 early_stop_counter += 1
@@ -219,7 +192,7 @@ def train_cycle(env, agent, episodes, max_steps, cycle_num, graph, start, goal, 
             "final_node": info.get("final_node", env.current_node),
             "dist_to_goal": info.get("dist_to_goal", float('inf')),
             "guided_steps": guided_steps,
-            "guided_ratio": guided_ratio,
+            "guided_ratio": guided_ratio_actual,
             "epsilon": agent.epsilon,
             "start": current_start,
             "goal": current_goal,
@@ -235,12 +208,8 @@ def train_cycle(env, agent, episodes, max_steps, cycle_num, graph, start, goal, 
                 writer.writeheader()
             writer.writerow(log_data)
 
-    # Plot
     plt.figure()
     plt.plot(rewards_history)
-    if phase_split > 0:
-        plt.axvline(phase_split, color='orange', linestyle='--', label='Phase Shift')
-        plt.legend()
     plt.title(f"Training Reward - Cycle {cycle_num} Agent {agent_idx}")
     plt.savefig(f"training_progress/reward_curve_cycle_{cycle_num}_agent{agent_idx}.png")
     plt.close()
